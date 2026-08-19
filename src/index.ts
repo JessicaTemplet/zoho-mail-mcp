@@ -1,9 +1,10 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+<![CDATA[import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
 // --- Config -----------------------------------------------------------
 // Self Client credentials from the Zoho API Console (api-console.zoho.com).
@@ -87,6 +88,11 @@ async function zohoFetch(path: string, init: RequestInit = {}): Promise<any> {
 // Cached for the life of the process. accountId and the primary send
 // address don't change mid-session, and re-fetching folders on every
 // call would be wasteful.
+//
+// Known limitation: if a folder is created or renamed in Zoho Mail after
+// this process starts, that change won't be visible here until restart —
+// there's no TTL or invalidation on this cache. Fine for a short-lived
+// local session; would need addressing for anything long-running.
 let cachedAccount: { accountId: string; primaryAddress: string } | null = null;
 let cachedFolders: any[] | null = null;
 
@@ -138,9 +144,49 @@ function extractMessageIdHeader(headerContent: string): string | null {
   return match ? match[1] : null;
 }
 
+// --- Argument validation -------------------------------------------------
+// Each tool gets a zod schema. A missing or malformed argument returns a
+// specific message ("searchKey: Required") instead of a raw TypeError from
+// a `!` assertion deep inside a case.
+const schemas = {
+  list_folders: z.object({}),
+  list_emails: z.object({
+    folder: z.string().optional(),
+    limit: z.number().min(1).max(200).default(10),
+    start: z.number().min(1).default(1),
+  }),
+  search_emails: z.object({
+    searchKey: z.string(),
+    limit: z.number().min(1).max(200).default(10),
+    start: z.number().min(1).default(1),
+  }),
+  get_email: z.object({
+    messageId: z.string(),
+    folderId: z.string(),
+  }),
+  create_draft_reply: z.object({
+    messageId: z.string(),
+    folderId: z.string(),
+    content: z.string(),
+    mailFormat: z.enum(["html", "plaintext"]).default("html"),
+    ccAddress: z.string().optional(),
+    bccAddress: z.string().optional(),
+  }),
+  create_draft: z.object({
+    toAddress: z.string(),
+    subject: z.string(),
+    content: z.string(),
+    mailFormat: z.enum(["html", "plaintext"]).default("html"),
+    ccAddress: z.string().optional(),
+    bccAddress: z.string().optional(),
+  }),
+} as const;
+
+type ToolName = keyof typeof schemas;
+
 // --- MCP server ----------------------------------------------------------
 const server = new Server(
-  { name: "zoho-mail-mcp", version: "1.0.0" },
+  { name: "zoho-mail-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -228,10 +274,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name, arguments: rawArgs } = request.params;
+
+  if (!(name in schemas)) {
+    return { content: [{ type: "text", text: `Error: Unknown tool: ${name}` }], isError: true };
+  }
+  const toolName = name as ToolName;
+
+  const parsed = schemas[toolName].safeParse(rawArgs ?? {});
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("; ");
+    return { content: [{ type: "text", text: `Error: invalid arguments for '${toolName}': ${issues}` }], isError: true };
+  }
+  const args = parsed.data as any;
 
   try {
-    switch (name) {
+    switch (toolName) {
       case "list_folders": {
         const folders = await getFolders();
         return {
@@ -255,11 +315,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "list_emails": {
         const { accountId } = await getAccount();
-        const folderId = await resolveFolderId(args?.folder as string);
-        const limit = (args?.limit as number) ?? 10;
-        const start = (args?.start as number) ?? 1;
+        const folderId = await resolveFolderId(args.folder);
         const data = await zohoFetch(
-          `/api/accounts/${accountId}/messages/view?folderId=${folderId}&start=${start}&limit=${limit}`
+          `/api/accounts/${accountId}/messages/view?folderId=${folderId}&start=${args.start}&limit=${args.limit}`
         );
         const emails = (data.data ?? []).map((m: any) => ({
           messageId: m.messageId,
@@ -276,11 +334,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "search_emails": {
         const { accountId } = await getAccount();
-        const searchKey = encodeURIComponent(args!.searchKey as string);
-        const limit = (args?.limit as number) ?? 10;
-        const start = (args?.start as number) ?? 1;
+        const searchKey = encodeURIComponent(args.searchKey);
         const data = await zohoFetch(
-          `/api/accounts/${accountId}/messages/search?searchKey=${searchKey}&start=${start}&limit=${limit}`
+          `/api/accounts/${accountId}/messages/search?searchKey=${searchKey}&start=${args.start}&limit=${args.limit}`
         );
         const emails = (data.data ?? []).map((m: any) => ({
           messageId: m.messageId,
@@ -296,13 +352,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_email": {
         const { accountId } = await getAccount();
-        const folderId = args!.folderId as string;
-        const messageId = args!.messageId as string;
+        const { folderId, messageId } = args;
 
-        const [detailsData, contentData, headerData] = await Promise.all([
+        const [detailsData, contentData] = await Promise.all([
           zohoFetch(`/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/details`),
           zohoFetch(`/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/content`),
-          zohoFetch(`/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/header`),
         ]);
         const d = detailsData.data;
 
@@ -332,8 +386,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "create_draft_reply": {
         const { accountId, primaryAddress } = await getAccount();
-        const folderId = args!.folderId as string;
-        const messageId = args!.messageId as string;
+        const { folderId, messageId } = args;
 
         const [detailsData, headerData] = await Promise.all([
           zohoFetch(`/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/details`),
@@ -348,11 +401,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           fromAddress: primaryAddress,
           toAddress: original.fromAddress,
           subject,
-          content: args!.content as string,
-          mailFormat: (args?.mailFormat as string) ?? "html",
+          content: args.content,
+          mailFormat: args.mailFormat,
         };
-        if (args?.ccAddress) body.ccAddress = args.ccAddress;
-        if (args?.bccAddress) body.bccAddress = args.bccAddress;
+        if (args.ccAddress) body.ccAddress = args.ccAddress;
+        if (args.bccAddress) body.bccAddress = args.bccAddress;
         if (origMessageIdHeader) {
           body.inReplyTo = origMessageIdHeader;
           body.refHeader = origMessageIdHeader;
@@ -377,13 +430,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const body: Record<string, unknown> = {
           mode: "draft",
           fromAddress: primaryAddress,
-          toAddress: args!.toAddress as string,
-          subject: args!.subject as string,
-          content: args!.content as string,
-          mailFormat: (args?.mailFormat as string) ?? "html",
+          toAddress: args.toAddress,
+          subject: args.subject,
+          content: args.content,
+          mailFormat: args.mailFormat,
         };
-        if (args?.ccAddress) body.ccAddress = args.ccAddress;
-        if (args?.bccAddress) body.bccAddress = args.bccAddress;
+        if (args.ccAddress) body.ccAddress = args.ccAddress;
+        if (args.bccAddress) body.bccAddress = args.bccAddress;
 
         const data = await zohoFetch(`/api/accounts/${accountId}/messages`, {
           method: "POST",
@@ -395,9 +448,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ],
         };
       }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
     return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
@@ -407,3 +457,4 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("Zoho Mail MCP server running");
+]]>

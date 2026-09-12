@@ -1,4 +1,4 @@
-<![CDATA[import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
@@ -457,4 +457,3 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("Zoho Mail MCP server running");
-]]>
